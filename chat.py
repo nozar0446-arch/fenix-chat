@@ -40,7 +40,7 @@ else:
 # =====================================================================
 #    КОНФИГУРАЦИЯ И НАСТРОЙКИ
 # =====================================================================
-VERSION = "1.7.0"  
+VERSION = "1.7.2"  
 
 FIREBASE_WEB_API_KEY_1 = "AIzaSyCXdIbA64CrRWq8-RGDc_LcNVPD_5bJL84"
 FIREBASE_WEB_API_KEY_2 = "AIzaSyAQzzGsmH4o3ZgFFZM017kw9zG0HRe7ZBg"  
