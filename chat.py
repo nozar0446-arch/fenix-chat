@@ -38,7 +38,7 @@ else:
     ssl._create_default_https_context = _create_unverified_https_context
 
 # =====================================================================
-#    КОНФИКУРАЦИЯ И НАСТРОЙКИ
+#    КОНФИГУРАЦИЯ И НАСТРОЙКИ
 # =====================================================================
 VERSION = "1.7.0"  
 
@@ -63,14 +63,17 @@ class XRLChat:
         self.config_file = "xrl_config.txt"
         self.theme_file = "xrl_theme.json"
         self.news_file = "news.json"
+        self.commands_file = "info_comand.json" # Подключаем файл команд
+        self.settings_file = "xrl_settings.json"
         
         self.current_app_name = 'server1'
         self.current_url = URL_SERVER_1
         self.current_api_key = FIREBASE_WEB_API_KEY_1
         
-        self.messages_dict = {}  # ID -> {name, session, txt, status}
+        self.messages_dict = {}  
         self.groups_raw = {} 
         self.news_data = []
+        self.commands_data = [] # Список для хранения загруженных команд
         self.current_path = "messages/chat"
         self.needs_update = True
         self.in_chat = False
@@ -106,6 +109,7 @@ class XRLChat:
         self.load_settings()
         self.load_theme()
         self.load_news()
+        self.load_commands() # Загружаем список команд при старте
         self.load_msg_cache()
 
     def encrypt(self, text): 
@@ -121,10 +125,22 @@ class XRLChat:
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, dict):
+                    content = f.read().strip()
+                    if content.startswith("{"):
+                        data = json.loads(content)
                         self.nick = data.get("nick", "thoned")
                         self.show_status = data.get("show_status", True)
+                    elif content:
+                        self.nick = content
+            except Exception:
+                pass
+
+        if os.path.exists(self.settings_file):
+            try:
+                with open(self.settings_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict) and "show_status" in data:
+                        self.show_status = data["show_status"]
             except Exception:
                 pass
 
@@ -132,6 +148,9 @@ class XRLChat:
         try:
             with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump({"nick": self.nick, "show_status": self.show_status}, f, ensure_ascii=False, indent=4)
+            
+            with open(self.settings_file, "w", encoding="utf-8") as f:
+                json.dump({"show_status": self.show_status}, f, ensure_ascii=False, indent=4)
         except Exception as e:
             logging.error(f"Ошибка сохранения настроек: {e}")
 
@@ -171,6 +190,18 @@ class XRLChat:
                     json.dump(self.news_data, f, indent=4, ensure_ascii=False)
             except Exception as e:
                 logging.error(f"Не удалось создать файл новостей: {e}")
+
+    def load_commands(self):
+        """ Метод чтения команд из info_comand.json """
+        if os.path.exists(self.commands_file):
+            try:
+                with open(self.commands_file, "r", encoding="utf-8") as f:
+                    self.commands_data = json.load(f)
+            except Exception as e:
+                logging.error(f"Ошибка чтения файла команд: {e}")
+                self.commands_data = ["Ошибка: Файл info_comand.json поврежден."]
+        else:
+            self.commands_data = ["Файл с описанием команд не найден."]
 
     def authenticate_anonymously(self):
         url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={self.current_api_key}"
@@ -385,11 +416,9 @@ class XRLChat:
             stdscr.addstr(6, 2, f" --- ROOM: {path} (type '/exit') ---", curses.color_pair(1))
             
             with self.msg_lock:
-                # Обычная сортировка (самые новые — снизу, старые — сверху)
                 sorted_keys = sorted(self.messages_dict.keys())
                 current_msgs = [self.get_formatted_msg(self.messages_dict[k]) for k in sorted_keys]
             
-            # Показываем последние 14 сообщений диалога, чтобы новые были снизу у ввода
             for i, msg in enumerate(current_msgs[-14:]):
                 try:
                     stdscr.addstr(8 + i, 2, msg[:75], curses.color_pair(1))
@@ -422,9 +451,14 @@ class XRLChat:
                     self.in_chat = False
                     break
                 if user_input.strip():
-                    pkt = f"send-message ({path}) ({self.session}) ({self.nick}) >{user_input}<"
+                    if user_input.strip() == "/random_money":
+                        side = random.choice(["орёл", "решка"])
+                        text_to_send = f"подкинул монетку и ему выпало {side}"
+                    else:
+                        text_to_send = user_input
+
+                    pkt = f"send-message ({path}) ({self.session}) ({self.nick}) >{text_to_send}<"
                     
-                    # 'z_' гарантирует, что локальное сообщение встанет в самый конец списка до ответа сервера
                     local_id = f"z_temp_{time.time()}_{random.randint(1000,9999)}"
                     self.process_msg(local_id, pkt, save=True, status="?")
                     
@@ -442,14 +476,12 @@ class XRLChat:
                                 with self.msg_lock:
                                     if tmp_id in self.messages_dict:
                                         if server_id:
-                                            # Атомарно перезаписываем сообщение под его настоящим серверным ID
                                             self.messages_dict[server_id] = {
                                                 "name": self.messages_dict[tmp_id]["name"],
                                                 "session": self.messages_dict[tmp_id]["session"],
                                                 "txt": self.messages_dict[tmp_id]["txt"],
                                                 "status": "" 
                                             }
-                                        # Удаляем временное сообщение БЕЗ задержек таймера
                                         self.messages_dict.pop(tmp_id, None)
                             else:
                                 with self.msg_lock:
@@ -726,6 +758,59 @@ class XRLChat:
             elif k in ['b', 'B']: 
                 break
 
+    def open_info_commands(self, stdscr):
+        """ Динамически выводит список команд из info_comand.json """
+        self.load_commands() # Читаем файл заново перед каждым входом
+        while True:
+            stdscr.bkgd(' ', curses.color_pair(1))
+            stdscr.erase()
+            self.draw_small_header(stdscr)
+            stdscr.addstr(6, 2, " [ INFO COMMANDS ] ", curses.color_pair(1))
+            
+            # Построчно выводим содержимое JSON-массива
+            for i, line in enumerate(self.commands_data[:14]):
+                try:
+                    stdscr.addstr(8 + i, 4, str(line), curses.color_pair(1))
+                except:
+                    pass
+                    
+            stdscr.addstr(22, 4, "Нажмите любую клавишу для возврата...", curses.A_REVERSE)
+            stdscr.refresh()
+            try:
+                stdscr.get_wch()
+            except:
+                pass
+            break
+
+    def open_information_menu(self, stdscr):
+        """ Единое информационное меню для Новостей, Списка команд и Авторов """
+        sub_opts = ["News", "Info Commands", "Credits", "Back"]
+        idx = 0
+        while True:
+            stdscr.bkgd(' ', curses.color_pair(1))
+            stdscr.erase()
+            self.draw_small_header(stdscr)
+            stdscr.addstr(6, 2, " [ INFORMATION ] ", curses.color_pair(1))
+            
+            for i, o in enumerate(sub_opts):
+                style = curses.A_REVERSE if i == idx else curses.color_pair(1)
+                stdscr.addstr(8 + i, 4, f" > {o} ", style)
+            stdscr.refresh()
+            
+            try:
+                k = stdscr.get_wch()
+            except:
+                continue
+            
+            if k in [curses.KEY_UP, 'k'] and idx > 0: idx -= 1
+            elif k in [curses.KEY_DOWN, 'j'] and idx < len(sub_opts)-1: idx += 1
+            elif k in [10, 13, '\n', '\r']:
+                if idx == 0: self.open_news(stdscr)
+                elif idx == 1: self.open_info_commands(stdscr)
+                elif idx == 2: self.open_credits(stdscr)
+                elif idx == 3: break
+            elif k in ['b', 'B']: break
+
     def open_settings(self, stdscr):
         s_opts = ["Change Nick", "Reset Session", "Toggle Status Icons", "Back"]
         s_idx = 0
@@ -841,7 +926,8 @@ class XRLChat:
         self.start_background_sync()
 
         main_sel = 0
-        main_opts = ["Chat", "Groups", "Servers", "News", "Settings", "Credits", "Exit"]
+        # Объединенный пункт "Information" заменяет старые "News" и "Credits"
+        main_opts = ["Chat", "Groups", "Servers", "Information", "Settings", "Exit"]
         
         while self.running:
             stdscr.erase()
@@ -873,10 +959,9 @@ class XRLChat:
                 if main_sel == 0: self.open_chat(stdscr, "messages/chat")
                 elif main_sel == 1: self.open_groups(stdscr)
                 elif main_sel == 2: self.open_servers(stdscr)
-                elif main_sel == 3: self.open_news(stdscr)    
+                elif main_sel == 3: self.open_information_menu(stdscr)
                 elif main_sel == 4: self.open_settings(stdscr)
-                elif main_sel == 5: self.open_credits(stdscr)
-                elif main_sel == 6: 
+                elif main_sel == 5: 
                     self.running = False
                     break
 
