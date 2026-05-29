@@ -41,7 +41,7 @@ else:
 # =====================================================================
 #    КОНФИГУРАЦИЯ И НАСТРОЙКИ
 # =====================================================================
-VERSION = "1.6.0"  
+VERSION = "1.6.7"  
 
 FIREBASE_WEB_API_KEY_1 = "AIzaSyCXdIbA64CrRWq8-RGDc_LcNVPD_5bJL84"
 FIREBASE_WEB_API_KEY_2 = "AIzaSyAQzzGsmH4o3ZgFFZM017kw9zG0HRe7ZBg"  
@@ -68,14 +68,16 @@ class XRLChat:
         self.current_url = URL_SERVER_1
         self.current_api_key = FIREBASE_WEB_API_KEY_1
         
-        self.messages_history = []
+        self.messages_dict = {}  
         self.groups_raw = {} 
         self.news_data = []
         self.current_path = "messages/chat"
         self.needs_update = True
         self.in_chat = False
         
-        self.data_lock = threading.Lock()
+        # Раздельные локи во избежание Deadlock при потере фокуса
+        self.msg_lock = threading.Lock()
+        self.group_lock = threading.Lock()
 
         self.theme = {
             "colors": {
@@ -131,7 +133,7 @@ class XRLChat:
             with open(self.config_file, "w", encoding="utf-8") as f:
                 f.write(self.nick)
         except Exception as e:
-            logging.error(f"Ошибка сохранения настроек: {e}")
+            logging.error(f"Ошибка保存настроек: {e}")
 
     def load_theme(self):
         if os.path.exists(self.theme_file):
@@ -168,7 +170,7 @@ class XRLChat:
                 self.news_data = [{"title": "Ошибка", "content": "Файл news.json поврежден."}]
         else:
             try:
-                self.news_data = [] # Создаем пустой список новостей
+                self.news_data = [] 
                 with open(self.news_file, "w", encoding="utf-8") as f:
                     json.dump(self.news_data, f, indent=4, ensure_ascii=False)
             except Exception as e:
@@ -195,10 +197,12 @@ class XRLChat:
     def load_msg_cache(self):
         try:
             with open(self.cache_file, "r", encoding="utf-8") as f:
+                idx = 0
                 for line in f:
                     dec = line.strip()
                     if "send-message" in dec: 
-                        self.process_msg(dec)
+                        self.process_msg(f"local_cache_{idx}", dec)
+                        idx += 1
         except Exception as e:
             logging.error(f"Ошибка загрузки кэша: {e}")
 
@@ -209,7 +213,7 @@ class XRLChat:
             if self.auth_token:
                 params['auth'] = self.auth_token
                 
-            res = requests.get(url, params=params, timeout=5)
+            res = requests.get(url, params=params, timeout=4)
             if res.status_code == 200:
                 data = res.json()
                 new_groups = {}
@@ -219,7 +223,7 @@ class XRLChat:
                         dec = self.decrypt(raw)
                         if dec: 
                             new_groups[k] = dec
-                with self.data_lock:
+                with self.group_lock:
                     self.groups_raw = new_groups
                 self.needs_update = True
         except Exception as e:
@@ -234,15 +238,18 @@ class XRLChat:
             if self.auth_token:
                 params['auth'] = self.auth_token
                 
-            res = requests.get(url, params=params, timeout=5)
+            res = requests.get(url, params=params, timeout=3)
             if res.status_code == 200:
                 snap = res.json()
                 if snap and isinstance(snap, dict):
                     for k in snap:
+                        # Быстрая проверка без лока, чтобы не вешать UI
+                        if k in self.messages_dict:
+                            continue
                         raw = snap[k].get('payload') if isinstance(snap[k], dict) else snap[k]
                         dec = self.decrypt(raw)
                         if dec and "send-message" in dec: 
-                            self.process_msg(dec, save=True)
+                            self.process_msg(k, dec, save=True)
                 self.needs_update = True
         except Exception as e:
             logging.error(f"Ошибка фонового обновления сообщений: {e}")
@@ -254,10 +261,10 @@ class XRLChat:
                     self.sync_chat_messages(self.current_path)
                 else:
                     self.update_groups_data()
-                time.sleep(2)  
+                time.sleep(1.5)  
         threading.Thread(target=loop, daemon=True).start()
 
-    def process_msg(self, dec, save=False):
+    def process_msg(self, msg_id, dec, save=False):
         match = re.search(r"send-message \((.*?)\) \((.*?)\) \((.*?)\) \>(.*)\<", dec)
         if not match:
             match = re.search(r"\(.*?\)\s\((.*?)\)\s\((.*?)\)\s>(.*)<", dec)
@@ -270,14 +277,16 @@ class XRLChat:
                 
             prefix = self.theme["ui"]["msg_prefix"].format(name=name, session=ses)
             m = f"{prefix}{txt}"
-            if m not in self.messages_history: 
-                self.messages_history.append(m)
-                if save:
-                    try:
-                        with open(self.cache_file, "a", encoding="utf-8") as f: 
-                            f.write(dec + "\n")
-                    except Exception as e:
-                        logging.error(f"Ошибка записи кэша: {e}")
+            
+            with self.msg_lock:
+                self.messages_dict[msg_id] = m
+                
+            if save:
+                try:
+                    with open(self.cache_file, "a", encoding="utf-8") as f: 
+                        f.write(dec + "\n")
+                except Exception as e:
+                    logging.error(f"Ошибка записи кэша: {e}")
 
     def draw_smooth_gradient(self, stdscr, y, x, text):
         grad_colors = self.theme["colors"]["gradient"]
@@ -306,6 +315,7 @@ class XRLChat:
         stdscr.addstr(4, 2, f" nick    : {self.nick}", curses.color_pair(1))
 
     def safe_input(self, stdscr, y, x, prompt):
+        stdscr.timeout(-1)  
         curses.curs_set(1)
         input_str = ""
         while True:
@@ -317,6 +327,7 @@ class XRLChat:
             try:
                 ch = stdscr.get_wch()
             except:
+                time.sleep(0.02) # Защита от флуда ошибками при потере фокуса окна
                 stdscr.touchwin()  
                 stdscr.redrawwin()
                 continue
@@ -338,14 +349,14 @@ class XRLChat:
     def open_chat(self, stdscr, path):
         self.in_chat = True
         self.current_path = path
-        self.messages_history = []
+        self.messages_dict = {}
         
         try:
             url = f"{self.current_url}/{path}.json"
             params = {}
             if self.auth_token:
                 params['auth'] = self.auth_token
-            res = requests.get(url, params=params, timeout=5)
+            res = requests.get(url, params=params, timeout=4)
             if res.status_code == 200:
                 snap = res.json()
                 if snap and isinstance(snap, dict):
@@ -353,24 +364,26 @@ class XRLChat:
                         raw = snap[k].get('payload') if isinstance(snap[k], dict) else snap[k]
                         dec = self.decrypt(raw)
                         if dec: 
-                            self.process_msg(dec)
+                            self.process_msg(k, dec)
             else:
-                self.messages_history.append("!! ОШИБКА ДОСТУПА К БАЗЕ !!")
+                self.messages_dict["err"] = "!! ОШИБКА ДОСТУПА К БАЗЕ !!"
         except Exception as e:
             logging.error(f"Не удалось получить доступ к чату ({path}): {e}")
-            self.messages_history.append("!! ОШИБКА СЕТИ !!")
+            self.messages_dict["err"] = "!! ОШИБКА СЕТИ !!"
             
         user_input = ""
-        stdscr.nodelay(False)
-        self.needs_update = True
-
+        stdscr.timeout(100) 
+        
         while self.in_chat:
             stdscr.bkgd(' ', curses.color_pair(1))
             stdscr.erase()
             self.draw_small_header(stdscr)
             stdscr.addstr(6, 2, f" --- ROOM: {path} (type '/exit') ---", curses.color_pair(1))
             
-            for i, msg in enumerate(self.messages_history[-14:]):
+            with self.msg_lock:
+                current_msgs = list(self.messages_dict.values())
+            
+            for i, msg in enumerate(current_msgs[-14:]):
                 try:
                     stdscr.addstr(8 + i, 2, msg[:75], curses.color_pair(1))
                 except:
@@ -390,8 +403,7 @@ class XRLChat:
             try:
                 key = stdscr.get_wch()
             except:
-                stdscr.touchwin()
-                stdscr.redrawwin()
+                time.sleep(0.03) # Предотвращает зависание панели ввода при потере фокуса
                 continue
 
             if key == curses.KEY_RESIZE:
@@ -404,14 +416,26 @@ class XRLChat:
                     break
                 if user_input.strip():
                     pkt = f"send-message ({path}) ({self.session}) ({self.nick}) >{user_input}<"
-                    try:
-                        url = f"{self.current_url}/{path}.json"
-                        params = {}
-                        if self.auth_token:
-                            params['auth'] = self.auth_token
-                        requests.post(url, json={'payload': self.encrypt(pkt)}, params=params, timeout=5)
-                    except Exception as e:
-                        logging.error(f"Ошибка отправки сообщения: {e}")
+                    
+                    local_id = f"temp_{random.randint(1000,9999)}_{time.time()}"
+                    self.process_msg(local_id, pkt, save=True)
+                    
+                    def send_worker(post_url, payload_pkt, auth_params, tmp_id):
+                        try:
+                            res = requests.post(post_url, json={'payload': self.encrypt(payload_pkt)}, params=auth_params, timeout=6)
+                            if res.status_code == 200:
+                                # Удаляем локальное эхо только после подтверждения сервером
+                                # Используем msg_lock безопасно
+                                threading.Timer(0.5, lambda: self.messages_dict.pop(tmp_id, None)).start()
+                        except Exception as e:
+                            logging.error(f"Ошибка асинхронной отправки: {e}")
+                    
+                    url = f"{self.current_url}/{path}.json"
+                    params = {}
+                    if self.auth_token:
+                        params['auth'] = self.auth_token
+                        
+                    threading.Thread(target=send_worker, args=(url, pkt, params, local_id), daemon=True).start()
                     user_input = ""
             
             elif key in [8, 127, 263, '\b', '\x7f', curses.KEY_BACKSPACE, 'KEY_BACKSPACE']: 
@@ -421,12 +445,13 @@ class XRLChat:
                 if ord(key) >= 32:
                     user_input += key
 
+        stdscr.timeout(-1) 
         self.in_chat = False
 
     def open_groups(self, stdscr):
         while True:
             parsed = []
-            with self.data_lock:
+            with self.group_lock:
                 current_groups = dict(self.groups_raw)
 
             for db_key, dec in current_groups.items():
@@ -451,6 +476,7 @@ class XRLChat:
                 try:
                     key = stdscr.get_wch()
                 except:
+                    time.sleep(0.02)
                     stdscr.touchwin()
                     stdscr.redrawwin()
                     continue
@@ -537,6 +563,7 @@ class XRLChat:
             try:
                 k = stdscr.get_wch()
             except:
+                time.sleep(0.02)
                 stdscr.touchwin()
                 stdscr.redrawwin()
                 continue
@@ -570,7 +597,7 @@ class XRLChat:
                     stdscr.refresh()
                     
                     if self.authenticate_anonymously():
-                        with self.data_lock:
+                        with self.group_lock:
                             self.groups_raw = {}
                         self.update_groups_data()
                         stdscr.addstr(13, 4, " Успешно переключено! ", curses.color_pair(1) | curses.A_BOLD)
@@ -649,6 +676,7 @@ class XRLChat:
             try:
                 k = stdscr.get_wch()
             except:
+                time.sleep(0.02)
                 stdscr.touchwin()
                 stdscr.redrawwin()
                 continue
@@ -683,6 +711,7 @@ class XRLChat:
             try:
                 k = stdscr.get_wch()
             except:
+                time.sleep(0.02)
                 stdscr.touchwin()
                 stdscr.redrawwin()
                 continue
@@ -791,6 +820,7 @@ class XRLChat:
             try:
                 k = stdscr.get_wch()
             except:
+                time.sleep(0.02)
                 stdscr.touchwin()
                 stdscr.redrawwin()
                 continue
@@ -809,7 +839,10 @@ class XRLChat:
                 elif main_sel == 3: self.open_news(stdscr)    
                 elif main_sel == 4: self.open_settings(stdscr)
                 elif main_sel == 5: self.open_credits(stdscr)
-                elif main_sel == 6: self.running = False
+                elif main_sel == 6: 
+                    self.running = False
+                    break
 
 if __name__ == "__main__":
-    curses.wrapper(XRLChat().run)
+    chat = XRLChat()
+    curses.wrapper(chat.run)
